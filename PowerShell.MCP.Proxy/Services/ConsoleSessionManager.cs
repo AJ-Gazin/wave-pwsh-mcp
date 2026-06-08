@@ -66,6 +66,17 @@ public class ConsoleSessionManager
     private readonly Dictionary<int, string> _pidToTitle = new();
 
     /// <summary>
+    /// Maps pwsh PIDs to the Wave Terminal block ID hosting them. Populated only when
+    /// the console was launched into a Wave block (see <see cref="PwshLauncherWave"/>);
+    /// absent for native-console, unowned, and non-Wave consoles. Lets the proxy mirror
+    /// the assigned nickname into the block's <c>frame:title</c> header — Wave does not
+    /// surface the OSC/console title that <c>$Host.UI.RawUI.WindowTitle</c> emits, so the
+    /// pipe-based title alone would leave the block header showing the raw launch command.
+    /// Cleared with <see cref="ClearDeadPipe"/> so a recycled PID can't pull a stale ID.
+    /// </summary>
+    private readonly Dictionary<int, string> _pidToBlockId = new();
+
+    /// <summary>
     /// Maps pwsh PIDs to the cwd the AI's most recent successful (or
     /// timeout / cached) <c>invoke_expression</c> ended at. Captured from
     /// the DLL's response header (which now carries <c>cwd</c>) so the
@@ -279,6 +290,7 @@ public class ConsoleSessionManager
             {
                 state.KnownBusyPids.Remove(pid.Value);
                 _pidToTitle.Remove(pid.Value);
+                _pidToBlockId.Remove(pid.Value);
                 _pidToLastAiCwd.Remove(pid.Value);
             }
             Console.Error.WriteLine($"[INFO] ConsoleSessionManager: Cleared dead pipe '{pipeName}' (agent={agentId})");
@@ -401,6 +413,25 @@ public class ConsoleSessionManager
             _pidToTitle[pwshPid] = title;
             return title;
         }
+    }
+
+    /// <summary>
+    /// Records the Wave block ID hosting the given pwsh PID. No-op for a null/empty
+    /// blockId (native / non-Wave launches), so callers can pass through unconditionally.
+    /// </summary>
+    public void SetBlockId(int pwshPid, string? blockId)
+    {
+        if (string.IsNullOrEmpty(blockId)) return;
+        lock (_lock) { _pidToBlockId[pwshPid] = blockId; }
+    }
+
+    /// <summary>
+    /// Returns the Wave block ID hosting the given pwsh PID, or null when the console
+    /// is not Wave-hosted (native window, unowned/claimed pipe, or off Wave entirely).
+    /// </summary>
+    public string? GetBlockId(int pwshPid)
+    {
+        lock (_lock) return _pidToBlockId.TryGetValue(pwshPid, out var blockId) ? blockId : null;
     }
 
     /// <summary>

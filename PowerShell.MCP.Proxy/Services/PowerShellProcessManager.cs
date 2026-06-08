@@ -76,15 +76,17 @@ public class PowerShellProcessManager
             existingPipes = sessionManager.EnumeratePipes(sessionManager.ProxyPid, agentId).ToHashSet();
         }
 
+        string? blockId = null;
         if (useWave)
         {
-            var launched = PwshLauncherWave.LaunchPwsh(agentId, startupCommands, startLocation, out _);
+            var launched = PwshLauncherWave.LaunchPwsh(agentId, startupCommands, startLocation, out blockId);
             if (!launched)
             {
                 // Wave launch failed — fall back to a native console window. That
                 // yields a real PID, so switch back to deterministic pipe naming.
                 pid = PwshLauncherWindows.LaunchPwsh(agentId, startupCommands, startLocation);
                 existingPipes = null;
+                blockId = null;
             }
             // On success pid stays 0 and existingPipes is retained → poll path below.
         }
@@ -121,6 +123,17 @@ public class PowerShellProcessManager
             {
                 return (false, string.Empty);
             }
+        }
+
+        // Wave-hosted consoles: remember which block hosts this pwsh so the proxy can
+        // later mirror the assigned nickname into the block's frame:title header. The
+        // pwsh PID is the last segment of the (now-known) pipe name. No-op off Wave
+        // (blockId stays null) and for the native fallback (cleared above).
+        if (blockId != null)
+        {
+            var pwshPid = ConsoleSessionManager.GetPidFromPipeName(pipeName);
+            if (pwshPid.HasValue)
+                ConsoleSessionManager.Instance.SetBlockId(pwshPid.Value, blockId);
         }
 
         var success = await NamedPipeClient.WaitForPipeReadyAsync(pipeName);
@@ -507,6 +520,83 @@ public static class PwshLauncherWave
             "-NoExit",
             "-File", tempFile,
         };
+    }
+
+    /// <summary>
+    /// Builds the argv (after wsh.exe) for `wsh setmeta`, which writes the block's
+    /// <c>frame:title</c> — the override Wave renders in the block header (alongside
+    /// frame:icon / frame:text). Everything is passed as plain argv (no shell), so the
+    /// "#PID Name" title — which contains '#' and a space — needs no escaping.
+    /// Kept internal + pure so a unit test can lock the argv without spawning wsh.
+    /// </summary>
+    internal static List<string> BuildSetMetaTitleArgs(string blockId, string title)
+    {
+        return new List<string>
+        {
+            "setmeta",
+            "-b", blockId,
+            $"frame:title={title}",
+        };
+    }
+
+    /// <summary>
+    /// Mirrors the console's assigned nickname into its Wave block header via
+    /// `wsh setmeta -b &lt;blockId&gt; frame:title=&lt;title&gt;`. Best-effort and idempotent:
+    /// the pipe-based <c>$Host.UI.RawUI.WindowTitle</c> (status line / other terminals'
+    /// tabs) remains the source of truth; this only adds Wave's block header, which
+    /// ignores the OSC/console title. Any failure (no wsh, locked-down Wave, dead block)
+    /// is logged and swallowed so it can never break console startup. No-op when blockId
+    /// is null/empty or wsh.exe can't be located.
+    /// </summary>
+    public static async Task SetBlockTitleAsync(string? blockId, string title)
+    {
+        if (string.IsNullOrEmpty(blockId)) return;
+
+        var wshPath = ResolveWshPath();
+        if (wshPath == null) return;
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = wshPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            foreach (var arg in BuildSetMetaTitleArgs(blockId, title))
+                psi.ArgumentList.Add(arg);
+
+            using var process = Process.Start(psi);
+            if (process == null) return;
+
+            // Drain both streams to avoid a pipe-buffer deadlock, then bound the wait.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try
+            {
+                await process.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
+                Console.Error.WriteLine("[WARN] wsh setmeta (frame:title) timed out.");
+                return;
+            }
+
+            if (process.ExitCode != 0)
+            {
+                var stderr = (await stderrTask).Trim();
+                Console.Error.WriteLine($"[WARN] wsh setmeta (frame:title) exited {process.ExitCode}: {stderr}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] wsh setmeta (frame:title) failed: {ex.Message}");
+        }
     }
 
     /// <summary>

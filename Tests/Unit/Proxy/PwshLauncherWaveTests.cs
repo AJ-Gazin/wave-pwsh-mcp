@@ -159,6 +159,25 @@ public class PwshLauncherWaveTests
             args);
     }
 
+    // --- BuildSetMetaTitleArgs -----------------------------------------------------
+
+    [Fact]
+    public void BuildSetMetaTitleArgs_ProducesExpectedWshSetMetaArgv()
+    {
+        var args = PwshLauncherWave.BuildSetMetaTitleArgs("62005875-1758-4535-a70e-8150fcf42f6f", "#82552 Diplo");
+
+        // setmeta args are plain argv (no shell), so the '#' and space in the title
+        // are a single value with no escaping. frame:title is the Wave header override.
+        Assert.Equal(
+            new[]
+            {
+                "setmeta",
+                "-b", "62005875-1758-4535-a70e-8150fcf42f6f",
+                "frame:title=#82552 Diplo",
+            },
+            args);
+    }
+
     // --- ResolveWshPath -----------------------------------------------------------
 
     [Fact]

@@ -82,6 +82,14 @@ public class PowerShellTools
         var title = ConsoleSessionManager.Instance.TryAssignNameToPid(pid.Value);
         if (title == null) return;
         await powerShellService.SetWindowTitleAsync(pipeName, title, cancellationToken);
+
+        // If this console is hosted in a Wave block, also mirror the nickname into the
+        // block's frame:title header. SetWindowTitleAsync above only sets the OSC/console
+        // title, which Wave ignores in its block frame — without this the header keeps
+        // showing the raw `pwsh.exe -File …` launch command. Best-effort; no-op off Wave.
+        var blockId = ConsoleSessionManager.Instance.GetBlockId(pid.Value);
+        if (blockId != null)
+            await PwshLauncherWave.SetBlockTitleAsync(blockId, title);
     }
 
     /// <summary>
