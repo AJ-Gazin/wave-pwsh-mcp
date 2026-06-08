@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using PowerShell.MCP.Proxy.Models;
 
 namespace PowerShell.MCP.Proxy.Services;
@@ -57,16 +58,37 @@ public class PowerShellProcessManager
     public static async Task<(bool Success, string PipeName)> StartPowerShellWithModuleAndPipeNameAsync(string agentId, string? startupCommands = null, string? startLocation = null)
     {
         int pid = 0;
-        HashSet<string>? existingPipes = null;
 
-        // macOS/Linux: Capture existing pipes BEFORE launching
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        // Decide launch strategy. The Wave launcher (hosts pwsh in a Wave Terminal
+        // block) and the macOS/Linux terminal launchers don't hand back the pwsh
+        // PID, so the new pipe is discovered by polling. Only the native Windows
+        // console launcher returns a PID for deterministic pipe-name construction.
+        bool useWave = PwshLauncherWave.ShouldUseWave(out _);
+        bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        bool usePoll = useWave || !isWindows;
+
+        // Poll-based strategies: capture existing pipes BEFORE launching so the new
+        // standby pipe can be told apart from pre-existing ones.
+        HashSet<string>? existingPipes = null;
+        if (usePoll)
         {
             var sessionManager = ConsoleSessionManager.Instance;
             existingPipes = sessionManager.EnumeratePipes(sessionManager.ProxyPid, agentId).ToHashSet();
         }
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (useWave)
+        {
+            var launched = PwshLauncherWave.LaunchPwsh(agentId, startupCommands, startLocation, out _);
+            if (!launched)
+            {
+                // Wave launch failed — fall back to a native console window. That
+                // yields a real PID, so switch back to deterministic pipe naming.
+                pid = PwshLauncherWindows.LaunchPwsh(agentId, startupCommands, startLocation);
+                existingPipes = null;
+            }
+            // On success pid stays 0 and existingPipes is retained → poll path below.
+        }
+        else if (isWindows)
         {
             pid = PwshLauncherWindows.LaunchPwsh(agentId, startupCommands, startLocation);
         }
@@ -192,6 +214,40 @@ internal static class PwshLauncherShared
         var core = $"{setLocation}$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {ModuleCaseFix}Import-Module PowerShell.MCP -Force; Remove-Module PSReadLine -ErrorAction SilentlyContinue";
         return string.IsNullOrEmpty(startupCommands) ? core : $"{core}; {startupCommands}";
     }
+
+    // Name of the env var that, when set, points the launched console at an explicit
+    // module (path to a .psd1 / .dll) instead of resolving 'PowerShell.MCP' off
+    // PSModulePath. Lets a dev build run as its own MCP without colliding with an
+    // installed PowerShell.MCP module of the same name.
+    internal const string ModulePathEnvVar = "POWERSHELL_MCP_MODULE_PATH";
+
+    // Reads POWERSHELL_MCP_MODULE_PATH; returns null when unset/blank (production default).
+    internal static string? ResolveModulePath()
+    {
+        var p = Environment.GetEnvironmentVariable(ModulePathEnvVar);
+        return string.IsNullOrWhiteSpace(p) ? null : p;
+    }
+
+    // Builds the Import-Module fragment. Explicit path → `Import-Module '<path>' -Force`
+    // (single quotes doubled per PowerShell); otherwise the by-name default.
+    internal static string BuildModuleImport(string? modulePath) =>
+        string.IsNullOrEmpty(modulePath)
+            ? "Import-Module PowerShell.MCP -Force"
+            : $"Import-Module '{modulePath.Replace("'", "''")}' -Force";
+
+    // Windows-flavored init body shared by the native console launcher (delivered via
+    // -Command) and the Wave launcher (delivered via a temp -File script). Sets the
+    // proxy/agent globals the module needs to name its pipe, imports the module, and
+    // KEEPS PSReadLine (Wave blocks and Windows consoles are real PTYs — unlike the
+    // non-Windows path which strips PSReadLine). cwd is established externally
+    // (CreateProcessW lpCurrentDirectory / Wave cmd:cwd), so no Set-Location here.
+    internal static string BuildWindowsInitBody(int proxyPid, string agentId, string? startupCommands, string? modulePath)
+    {
+        var escapedAgentId = agentId.Replace("'", "''");
+        var moduleImport = BuildModuleImport(modulePath);
+        var core = $"$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {moduleImport}; Import-Module PSReadLine";
+        return string.IsNullOrEmpty(startupCommands) ? core : $"{core}; {startupCommands}";
+    }
 }
 
 /// <summary>
@@ -277,18 +333,12 @@ public static class PwshLauncherWindows
             var si = new STARTUPINFOW { cb = (uint)Marshal.SizeOf<STARTUPINFOW>() };
             var pi = new PROCESS_INFORMATION();
 
-            // Build command with optional startup commands (pre-built Write-Host statements)
-            // Set global variables with proxy PID and agent ID before importing module
+            // Build command with optional startup commands (pre-built Write-Host statements).
+            // Set global variables with proxy PID and agent ID before importing module.
+            // Honors POWERSHELL_MCP_MODULE_PATH so a dev build imports its own module.
             var proxyPid = Process.GetCurrentProcess().Id;
-            string command;
-            if (!string.IsNullOrEmpty(startupCommands))
-            {
-                command = $"$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{agentId}'; Import-Module PowerShell.MCP -Force; Import-Module PSReadLine; {startupCommands}";
-            }
-            else
-            {
-                command = $"$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{agentId}'; Import-Module PowerShell.MCP -Force; Import-Module PSReadLine";
-            }
+            var modulePath = PwshLauncherShared.ResolveModulePath();
+            var command = PwshLauncherShared.BuildWindowsInitBody(proxyPid, agentId, startupCommands, modulePath);
             string commandLine = $"pwsh.exe -NoExit -Command \"{command}\"";
 
             bool ok = CreateProcessW(
@@ -325,6 +375,239 @@ public static class PwshLauncherWindows
         }
 
         return pid;
+    }
+}
+
+/// <summary>
+/// Windows launcher that hosts pwsh inside a NEW Wave Terminal block (via `wsh run`)
+/// instead of a standalone console window. Used when the proxy runs under Wave Terminal.
+/// The Wave-hosted pwsh is a child of Wave's server (not the proxy), so — like the
+/// macOS/Linux launchers — we don't get its PID and the caller discovers the pipe by
+/// polling. The launched pwsh sets the same proxy/agent globals, so its named pipe is
+/// still discoverable by EnumeratePipes(ProxyPid, agentId).
+/// </summary>
+public static class PwshLauncherWave
+{
+    private const string UseWaveEnvVar = "POWERSHELL_MCP_USE_WAVE";
+
+    private static readonly Regex UuidRegex = new(
+        @"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Decides whether start_console should host pwsh in a Wave block.
+    /// auto (default): Wave iff on Windows, running under Wave (WAVETERM set), and wsh.exe
+    /// is locatable. POWERSHELL_MCP_USE_WAVE=0/false/off forces native; =1/true/on forces
+    /// Wave intent but still requires a locatable wsh (warns and returns false otherwise).
+    /// </summary>
+    internal static bool ShouldUseWave(out string? wshPath)
+    {
+        wshPath = null;
+
+        // Wave hosting is Windows-only for now; the macOS/Linux paths already open
+        // their own native terminals.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            return false;
+
+        var overrideVal = Environment.GetEnvironmentVariable(UseWaveEnvVar)?.Trim().ToLowerInvariant();
+        bool forceOff = overrideVal is "0" or "false" or "off";
+        bool forceOn = overrideVal is "1" or "true" or "on";
+
+        if (forceOff)
+            return false;
+
+        // auto: require a Wave environment. forceOn skips this gate but still needs wsh.
+        if (!forceOn && string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WAVETERM")))
+            return false;
+
+        wshPath = ResolveWshPath();
+        if (wshPath == null)
+        {
+            if (forceOn)
+                Console.Error.WriteLine($"[WARN] {UseWaveEnvVar} requested Wave mode but wsh.exe was not found; falling back to a native console.");
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Locates wsh.exe: WAVETERM_WSHBINDIR first (Wave exports this), then PATH. Null if absent.
+    /// </summary>
+    internal static string? ResolveWshPath()
+    {
+        var binDir = Environment.GetEnvironmentVariable("WAVETERM_WSHBINDIR");
+        if (!string.IsNullOrEmpty(binDir))
+        {
+            var candidate = Path.Combine(binDir, "wsh.exe");
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        var pathVar = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrEmpty(pathVar))
+        {
+            foreach (var dir in pathVar.Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(dir))
+                    continue;
+                try
+                {
+                    var candidate = Path.Combine(dir.Trim(), "wsh.exe");
+                    if (File.Exists(candidate))
+                        return candidate;
+                }
+                catch
+                {
+                    // Skip malformed PATH entries (e.g. invalid path chars).
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Builds the self-deleting temp init script the Wave-hosted pwsh runs via -File.
+    /// Windows-flavored (keeps PSReadLine; no Unix ModuleCaseFix / Remove-Module). cwd is
+    /// also set in-script as a belt-and-suspenders complement to `wsh run --cwd`.
+    /// </summary>
+    internal static string BuildWaveInitScript(int proxyPid, string agentId, string? startupCommands, string? startLocation, string? modulePath)
+    {
+        var setLocation = string.IsNullOrEmpty(startLocation)
+            ? string.Empty
+            : $"Set-Location -LiteralPath '{startLocation.Replace("'", "''")}'; ";
+        var body = PwshLauncherShared.BuildWindowsInitBody(proxyPid, agentId, startupCommands, modulePath);
+
+        // Self-delete on the first line so no script debris survives the launch.
+        return $"Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue{Environment.NewLine}{setLocation}{body}";
+    }
+
+    /// <summary>
+    /// Builds the argv (after wsh.exe) for `wsh run`, which hosts pwsh in a new Wave block and
+    /// — unlike `wsh createblock` — actually launches the command server-side (createblock sets
+    /// the cmd meta but never triggers the run). Everything after `--` is passed to pwsh as
+    /// plain argv (no shell, no JSON), so the Windows temp path needs no escaping.
+    ///
+    /// -NoProfile keeps the AI console clean: the native MCP launcher relies on the user's
+    /// profile self-detecting the proxy as its parent process to fast-path, but a Wave-hosted
+    /// pwsh is parented by the Wave server, so that detection can't fire. Skipping the profile
+    /// avoids its startup cost and side effects (Set-Location, Starship, etc.) while preserving
+    /// PATH, which is inherited from the environment rather than set by the profile.
+    /// </summary>
+    internal static List<string> BuildWshRunArgs(string tempFile, string cwd)
+    {
+        return new List<string>
+        {
+            "run",
+            "--cwd", cwd,
+            "--",
+            "pwsh.exe",
+            "-NoProfile",
+            "-NoExit",
+            "-File", tempFile,
+        };
+    }
+
+    /// <summary>
+    /// Launches pwsh inside a new Wave block via `wsh run`. Returns true on success (blockId
+    /// parsed from stdout). On ANY failure logs to stderr and returns false so the caller can
+    /// fall back to a native console. `wsh run` returns as soon as the block is created (it
+    /// does not wait for the command), so a failure is known synchronously within the wsh
+    /// timeout — we do NOT wait for the named pipe here; the caller polls for it.
+    /// </summary>
+    public static bool LaunchPwsh(string agentId, string? startupCommands, string? startLocation, out string? blockId)
+    {
+        blockId = null;
+
+        var wshPath = ResolveWshPath();
+        if (wshPath == null)
+        {
+            Console.Error.WriteLine("[WARN] Wave launch requested but wsh.exe was not found; falling back to a native console.");
+            return false;
+        }
+
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var cwd = (!string.IsNullOrEmpty(startLocation) && Directory.Exists(startLocation))
+            ? startLocation
+            : userProfile;
+
+        var proxyPid = Process.GetCurrentProcess().Id;
+        var modulePath = PwshLauncherShared.ResolveModulePath();
+        var script = BuildWaveInitScript(proxyPid, agentId, startupCommands, startLocation, modulePath);
+
+        var tempFile = Path.Combine(Path.GetTempPath(), $"pwsh-mcp-wave-init-{Guid.NewGuid():N}.ps1");
+        try
+        {
+            File.WriteAllText(tempFile, script);
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = wshPath,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            foreach (var arg in BuildWshRunArgs(tempFile, cwd))
+                psi.ArgumentList.Add(arg);
+
+            using var process = Process.Start(psi);
+            if (process == null)
+            {
+                Console.Error.WriteLine("[WARN] Failed to start wsh; falling back to a native console.");
+                TryDeleteTemp(tempFile);
+                return false;
+            }
+
+            // Drain both streams asynchronously to avoid a pipe-buffer deadlock.
+            var stdoutTask = process.StandardOutput.ReadToEndAsync();
+            var stderrTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit(10000))
+            {
+                Console.Error.WriteLine("[WARN] wsh run timed out; falling back to a native console.");
+                try { process.Kill(entireProcessTree: true); } catch { /* best effort */ }
+                TryDeleteTemp(tempFile);
+                return false;
+            }
+
+            var stdout = stdoutTask.GetAwaiter().GetResult();
+            var stderr = stderrTask.GetAwaiter().GetResult();
+
+            if (process.ExitCode != 0)
+            {
+                Console.Error.WriteLine($"[WARN] wsh run exited {process.ExitCode}: {stderr.Trim()}; falling back to a native console.");
+                TryDeleteTemp(tempFile);
+                return false;
+            }
+
+            var match = UuidRegex.Match(stdout);
+            blockId = match.Success ? match.Value : null;
+            Console.Error.WriteLine($"[INFO] Wave block created for agent '{agentId}' (blockId={blockId ?? "unknown"}).");
+
+            // The block's pwsh self-deletes the temp script on its first line; no cleanup here.
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Wave launch failed: {ex.Message}; falling back to a native console.");
+            TryDeleteTemp(tempFile);
+            return false;
+        }
+    }
+
+    private static void TryDeleteTemp(string tempFile)
+    {
+        try
+        {
+            if (File.Exists(tempFile))
+                File.Delete(tempFile);
+        }
+        catch
+        {
+            // Best effort — an orphaned init script in %TEMP% is harmless.
+        }
     }
 }
 
