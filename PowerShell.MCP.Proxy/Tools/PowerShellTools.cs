@@ -39,11 +39,13 @@ public class PowerShellTools
         if (!pid.HasValue) return null;
         var aiCwd = ConsoleSessionManager.Instance.GetLastAiCwd(pid.Value);
         if (string.IsNullOrEmpty(aiCwd)) return null;
-        // Case-insensitive comparison on Windows; Path.GetFullPath normalizes
-        // separators and trailing slashes so "C:\Project" and "C:\Project\"
-        // don't trigger a spurious cd.
-        var normalizedAi = Path.GetFullPath(aiCwd);
-        var normalizedLive = Path.GetFullPath(liveCwd);
+        // Normalize separators (GetFullPath) and strip a trailing directory
+        // separator (TrimEndingDirectorySeparator — GetFullPath alone keeps it)
+        // so "C:\Project" and "C:\Project\" don't trigger a spurious cd. Drive
+        // roots ("C:\", "/") keep their separator. Comparison is
+        // case-insensitive on Windows, case-sensitive elsewhere.
+        var normalizedAi = Path.TrimEndingDirectorySeparator(Path.GetFullPath(aiCwd));
+        var normalizedLive = Path.TrimEndingDirectorySeparator(Path.GetFullPath(liveCwd));
         var comparison = OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
@@ -90,6 +92,25 @@ public class PowerShellTools
         var blockId = ConsoleSessionManager.Instance.GetBlockId(pid.Value);
         if (blockId != null)
             await PwshLauncherWave.SetBlockTitleAsync(blockId, title);
+    }
+
+    /// <summary>
+    /// Shows the green claim notice on a console that was just claimed — the
+    /// visible counterpart to the yellow "AI session disconnected" notice the
+    /// polling engine prints when a console loses its owner. Uses the
+    /// caller-supplied banner when present, otherwise the default
+    /// "AI session connected." line, so a custom banner naturally REPLACES
+    /// (never doubles) the generic notice. Rendered as a silent command (no
+    /// command echo) with a trailing prompt so the console is left ready.
+    /// </summary>
+    internal static async Task ShowClaimNoticeAsync(IPowerShellService powerShellService, string pipeName, string? banner, CancellationToken cancellationToken)
+    {
+        var message = string.IsNullOrEmpty(banner) ? "AI session connected." : banner;
+        var escaped = message.Replace("'", "''");
+        await powerShellService.ExecuteSilentAsync(
+            pipeName,
+            $"[Console]::WriteLine(); [Console]::WriteLine(); Write-Host '{escaped}' -ForegroundColor Green; [Console]::WriteLine(); try {{ $p = & {{ prompt }}; [Console]::Write($p.TrimEnd(' ').TrimEnd('>') + '> ' + \"`e[0K\") }} catch {{ [Console]::Write(\"PS $((Get-Location).Path)> `e[0K\") }}",
+            cancellationToken);
     }
 
     /// <summary>
@@ -151,7 +172,7 @@ public class PowerShellTools
             return Wrap(error);
 
         // Find a ready pipe
-        var (readyPipeName, consoleSwitched, closedConsoleMessages, allPipesStatusInfo, _) = await FindReadyPipeAsync(pipeDiscoveryService, agentId, cancellationToken);
+        var (readyPipeName, consoleSwitched, closedConsoleMessages, allPipesStatusInfo, liveCwd) = await FindReadyPipeAsync(pipeDiscoveryService, agentId, cancellationToken);
 
         if (readyPipeName == null)
         {
@@ -173,6 +194,20 @@ public class PowerShellTools
             if (consoleSwitched)
             {
                 await SetConsoleTitleAsync(powerShellService, readyPipeName, cancellationToken);
+                await ShowClaimNoticeAsync(powerShellService, readyPipeName, null, cancellationToken);
+            }
+
+            // First attach for this agent (resume / cold-start). Unlike
+            // invoke_expression, get_current_location is a query — its whole job
+            // is to report where the console is, so we PRESERVE the (possibly
+            // user-prepared) cwd and do not move to $HOME. We only surface the
+            // "new server session" notice so the AI knows prior variables/modules
+            // may not be present. Only fires on a genuine first reclaim
+            // (consoleSwitched); mid-session switches return false.
+            string? newSessionNotice = null;
+            if (consoleSwitched && ConsoleSessionManager.Instance.TryMarkFirstAttach(agentId))
+            {
+                newSessionNotice = BuildNewSessionNotice(GetConsoleName(readyPipeName), liveCwd ?? "the console's current location", null);
             }
 
             // Get location (DLL will include its own cached outputs automatically)
@@ -186,6 +221,11 @@ public class PowerShellTools
             if (closedConsoleMessages.Count > 0)
             {
                 response.AppendLine(string.Join("\n", closedConsoleMessages));
+                response.AppendLine();
+            }
+            if (!string.IsNullOrEmpty(newSessionNotice))
+            {
+                response.AppendLine(newSessionNotice);
                 response.AppendLine();
             }
             if (busyStatusInfo.Length > 0)
@@ -307,7 +347,10 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
                 ? sessionAiCwd
                 : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             Console.Error.WriteLine($"[INFO] No ready PowerShell console found, auto-starting at {autoStartLocation}... Reason: {allPipesStatusInfo}");
-            var (success, locationResult) = await StartConsoleInternal(powerShellService, agentId, null, autoStartLocation, cancellationToken);
+            // Spawning a console for the AI's pipeline is a new attach, so show
+            // the default green "AI session connected." notice at startup (same
+            // lifecycle marker as a claim).
+            var (success, locationResult) = await StartConsoleInternal(powerShellService, agentId, BuildStartupCommands(null, null), autoStartLocation, cancellationToken);
             if (!success)
             {
                 return Wrap(locationResult); // Error message
@@ -339,6 +382,7 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
             // execute. Drift check below catches the case where the
             // sibling has its own LastAiCwd from prior AI work.
             await SetConsoleTitleAsync(powerShellService, readyPipeName, cancellationToken);
+            await ShowClaimNoticeAsync(powerShellService, readyPipeName, null, cancellationToken);
             startupNotice = $"ℹ️ Switched to console {GetConsoleName(readyPipeName)}. Pipeline running on the new console.";
         }
 
@@ -352,6 +396,32 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
         if (var1Error != null)
         {
             return Wrap(var1Error);
+        }
+
+        // First console attach for this agent in the proxy's lifetime — the
+        // resume / cold-start boundary. The proxy is fresh but the AI may carry
+        // a stale cwd/state assumption from earlier in the conversation, and the
+        // console we just spawned/reclaimed could be sitting anywhere. Normalize
+        // to $HOME so this first command runs at a predictable baseline (not an
+        // inherited or arbitrary cwd), and replace the plain spawn/switch notice
+        // with the "new server session" notice. We do NOT suppress: the move is
+        // prepended to the pipeline (one pipe call, no extra AI round-trip), and
+        // a reclaim's prior cwd is surfaced as a restore hint. Mid-session
+        // re-attaches (TryMarkFirstAttach == false) keep the existing notices.
+        if (readyPipeName != null && sessionManager.TryMarkFirstAttach(agentId))
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string? priorCwd = null;
+            if (!string.IsNullOrEmpty(liveCwd))
+            {
+                var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                var normLive = Path.TrimEndingDirectorySeparator(Path.GetFullPath(liveCwd));
+                var normHome = Path.TrimEndingDirectorySeparator(Path.GetFullPath(home));
+                if (!string.Equals(normLive, normHome, comparison)) priorCwd = liveCwd;
+            }
+            pipeline = $"Set-Location -LiteralPath '{home.Replace("'", "''")}'; {pipeline}";
+            liveCwd = home;
+            startupNotice = BuildNewSessionNotice(GetConsoleName(readyPipeName), home, priorCwd);
         }
 
         // Cwd drift detection: if the user typed `cd` in the visible console
@@ -385,7 +455,7 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
                 bailResponse.AppendLine(startupNotice);
                 bailResponse.AppendLine();
             }
-            bailResponse.AppendLine($"ℹ️ User changed cwd in console {driftConsoleName} from '{drift.Value.AiCwd}' to '{drift.Value.LiveCwd}'.");
+            bailResponse.AppendLine($"ℹ️ cwd in console {driftConsoleName} changed from '{drift.Value.AiCwd}' to '{drift.Value.LiveCwd}' outside the AI's commands (e.g. a `cd` typed in the console).");
             bailResponse.AppendLine($"Pipeline NOT executed. Re-issue to run at '{drift.Value.LiveCwd}', or prepend `Set-Location -LiteralPath '{drift.Value.AiCwd.Replace("'", "''")}';` to revert.");
             return Wrap(bailResponse.ToString());
         }
@@ -678,13 +748,6 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
                                     successResponse.AppendLine();
                                     successResponse.AppendLine(scopeWarning);
                                 }
-                                // One-time hint about MarkdownPointer module (pipeline-only; output checks caused false positives on incidental .md mentions).
-                                var markdownHint = PipelineHelper.CheckMarkdownFileHint(pipeline, agentId);
-                                if (!string.IsNullOrEmpty(markdownHint))
-                                {
-                                    successResponse.AppendLine();
-                                    successResponse.AppendLine(markdownHint);
-                                }
                                 // TODO: Uncomment when JsonDuo is published to PS Gallery
                                 // var jsonHint = PipelineHelper.CheckJsonFileHint(pipeline, agentId)
                                 //     ?? PipelineHelper.CheckJsonFileHint(output, agentId);
@@ -940,16 +1003,15 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
 
         var forceNew = !string.IsNullOrEmpty(reason);
 
-        // Skip unowned-pipe discovery when the caller didn't pin a target
-        // cwd. Without an explicit start_location, the AI hasn't expressed
-        // a "where I want to be" intent; claiming an unowned console
-        // (whose cwd is whatever the user happened to be in when they
-        // ran Import-Module) would inherit an arbitrary cwd and confuse
-        // subsequent invoke_expression calls. A fresh console at the
-        // proxy's default home is the predictable baseline. Already-owned
-        // standby consoles are still reused — the skip only blocks the
-        // unowned-claim step.
-        var includeUnowned = !string.IsNullOrEmpty(start_location);
+        // Reuse first to keep the desktop from filling up with console windows:
+        // when no reason is given we reclaim ANY available console — an already
+        // owned standby OR an unowned one (a prior session's released console or
+        // a user-started one) — and only spawn a fresh one when nothing is
+        // available. The cwd a reclaimed console happens to sit at no longer
+        // needs an opt-in (the old start_location gate): the first-attach
+        // treatment below normalizes it (move to $HOME for execution) and the
+        // "new server session" notice tells the AI its prior context may differ.
+        var includeUnowned = true;
 
         // When no reason is given, try to reuse an existing standby console
         if (!forceNew)
@@ -961,21 +1023,38 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
                 if (discoveryResult.ConsoleSwitched)
                 {
                     await SetConsoleTitleAsync(powerShellService, discoveryResult.ReadyPipeName, cancellationToken);
+                    // Newly claimed: show the caller's banner, or the default
+                    // "AI session connected." notice when none was given.
+                    await ShowClaimNoticeAsync(powerShellService, discoveryResult.ReadyPipeName, banner, cancellationToken);
                 }
-
-                // Display banner on the existing console silently (message only, no command echo)
-                if (!string.IsNullOrEmpty(banner))
+                else if (!string.IsNullOrEmpty(banner))
                 {
-                    var escaped = banner.Replace("'", "''");
-                    await powerShellService.ExecuteSilentAsync(
-                        discoveryResult.ReadyPipeName,
-                        $"[Console]::WriteLine(); [Console]::WriteLine(); Write-Host '{escaped}' -ForegroundColor Green; [Console]::WriteLine(); try {{ $p = & {{ prompt }}; [Console]::Write($p.TrimEnd(' ').TrimEnd('>') + '> ' + \"`e[0K\") }} catch {{ [Console]::Write(\"PS $((Get-Location).Path)> `e[0K\") }}",
-                        cancellationToken);
+                    // Reused an already-owned standby console with an explicit
+                    // banner — still surface the AI's banner (a greeting / joke),
+                    // but no generic "connected" notice since nothing was claimed.
+                    await ShowClaimNoticeAsync(powerShellService, discoveryResult.ReadyPipeName, banner, cancellationToken);
                 }
 
                 var reuseLocationResult = await powerShellService.GetCurrentLocationFromPipeAsync(discoveryResult.ReadyPipeName, cancellationToken);
 
+                // First attach for this agent (resume / cold-start). Mark it so a
+                // following invoke_expression treats this console as owned-active
+                // (no second $HOME normalization). Like get_current_location,
+                // start_console is non-executing, so we preserve the console's cwd
+                // and only surface the "new server session" notice when we reclaimed
+                // an existing (unowned) console that may carry a prior session's state.
+                string? reuseNewSessionNotice = null;
+                if (ConsoleSessionManager.Instance.TryMarkFirstAttach(agentId) && discoveryResult.ConsoleSwitched)
+                {
+                    reuseNewSessionNotice = BuildNewSessionNotice(GetConsoleName(discoveryResult.ReadyPipeName), discoveryResult.LiveCwd ?? "the console's current location", null);
+                }
+
                 var reuseResponse = new StringBuilder();
+                if (!string.IsNullOrEmpty(reuseNewSessionNotice))
+                {
+                    reuseResponse.AppendLine(reuseNewSessionNotice);
+                    reuseResponse.AppendLine();
+                }
                 // Report closed consoles detected during discovery
                 if (discoveryResult.ClosedConsoleMessages.Count > 0)
                 {
@@ -1010,6 +1089,12 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
             return Wrap(startResult); // Error message
         }
 
+        // Mark first attach so a following invoke_expression sees an owned-active
+        // console and does not re-normalize to $HOME. No "new server session"
+        // notice here: a freshly spawned console is clean (nothing carried over)
+        // and starts at the resolved start_location / $HOME the AI asked for.
+        ConsoleSessionManager.Instance.TryMarkFirstAttach(agentId);
+
         // Set console window title
         var newPipeName = ConsoleSessionManager.Instance.GetActivePipeName(agentId);
         if (newPipeName != null)
@@ -1043,27 +1128,49 @@ When editing source code files, ALWAYS use variables for -OldText, -Replacement,
     }
 
     /// <summary>
-    /// Builds PowerShell commands to display banner and/or reason at console startup.
-    /// Banner is shown in green, reason in dark yellow.
-    /// Returns null if both are empty, or a string of PowerShell commands.
+    /// Builds the "new server session" notice shown on the proxy's FIRST
+    /// console attach for an agent (the resume / cold-start boundary). The proxy
+    /// restarted (or just started), so its runtime state is fresh, but the AI may
+    /// still carry intent from earlier in the conversation — variables, modules,
+    /// and cwd it set before are NOT guaranteed on this console. <paramref
+    /// name="currentCwd"/> is where the console now sits (for invoke_expression we
+    /// move it to $HOME; get_current_location reports it as-is). When the console
+    /// was reclaimed from a prior session/user and we moved away from its cwd,
+    /// <paramref name="priorCwdToRestore"/> carries that cwd as a one-line restore
+    /// hint (null when nothing was displaced, e.g. a fresh spawn or a preserved cwd).
     /// </summary>
-    private static string? BuildStartupCommands(string? banner, string? reason)
+    internal static string BuildNewSessionNotice(string consoleName, string currentCwd, string? priorCwdToRestore)
     {
-        if (string.IsNullOrEmpty(banner) && string.IsNullOrEmpty(reason))
-            return null;
-
-        var parts = new List<string>();
-        if (!string.IsNullOrEmpty(banner))
+        var sb = new StringBuilder();
+        sb.Append($"🔄 New server session — attached to console {consoleName}, now at {currentCwd}. ");
+        sb.Append("Variables, modules, functions, and cwd from earlier in this conversation are not carried over to this console.");
+        if (!string.IsNullOrEmpty(priorCwdToRestore))
         {
-            var escaped = banner.Replace("'", "''");
-            parts.Add($"Write-Host '{escaped}' -ForegroundColor Green");
+            sb.Append($" The console was at '{priorCwdToRestore}' — run Set-Location -LiteralPath '{priorCwdToRestore.Replace("'", "''")}' to resume there.");
         }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Builds PowerShell commands to display the startup notice on a newly
+    /// spawned console. A spawned console is a new AI attach, so it always
+    /// shows a green line — the caller's banner when given, otherwise the
+    /// default "AI session connected." (mirroring the claim path's
+    /// ShowClaimNoticeAsync, so a custom banner replaces rather than doubles
+    /// the generic notice). The optional reason is appended in dark yellow.
+    /// </summary>
+    internal static string BuildStartupCommands(string? banner, string? reason)
+    {
+        var parts = new List<string>();
+
+        // Green lifecycle line — banner if supplied, else the default notice.
+        var greenLine = string.IsNullOrEmpty(banner) ? "AI session connected." : banner;
+        parts.Add($"Write-Host '{greenLine.Replace("'", "''")}' -ForegroundColor Green");
+
         if (!string.IsNullOrEmpty(reason))
         {
-            if (parts.Count > 0)
-                parts.Add("Write-Host ''");  // blank line between banner and reason
-            var escaped = reason.Replace("'", "''");
-            parts.Add($"Write-Host 'Reason: {escaped}' -ForegroundColor DarkYellow");
+            parts.Add("Write-Host ''");  // blank line between notice and reason
+            parts.Add($"Write-Host 'Reason: {reason.Replace("'", "''")}' -ForegroundColor DarkYellow");
         }
         parts.Add("Write-Host ''");  // blank line before prompt
         return string.Join("; ", parts);

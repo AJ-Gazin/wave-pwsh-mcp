@@ -298,87 +298,63 @@ function Get-MCPProxyPath {
 .OUTPUTS
     PSCustomObject with Owned, ProxyPid, AgentId, and ClientName properties
 #>
-function Get-MCPOwner {
-    [CmdletBinding()]
-    [OutputType([PSCustomObject])]
-    param()
+function Get-McpStatus {
+    # Internal helper: builds the unified PowerShell.MCP.Status object that
+    # Get-MCPOwner and Restart-MCPServer both return (same type + columns).
+    $engineReady = [PowerShell.MCP.MCPModuleInitializer]::EngineReady
+    $lastError   = [PowerShell.MCP.MCPModuleInitializer]::LastEngineErrorMessage
 
     $pipeName = [PowerShell.MCP.MCPModuleInitializer]::GetPipeName()
-
-    if (-not $pipeName) {
-        return [PSCustomObject]@{
-            Owned      = $false
-            ProxyPid   = $null
-            AgentId    = $null
-            ClientName = $null
-        }
-    }
-
-    # Parse pipe name segments
-    # Unowned: PSMCP.{pwshPid} (2 segments)
-    # Owned:   PSMCP.{proxyPid}.{agentId}.{pwshPid} (4 segments)
-    $segments = $pipeName.Split('.')
-
-    if ($segments.Length -ne 4) {
-        return [PSCustomObject]@{
-            Owned      = $false
-            ProxyPid   = $null
-            AgentId    = $null
-            ClientName = $null
-        }
-    }
-
-    $proxyPid = [int]$segments[1]
-    $agentId  = $segments[2]
-
-    # Determine client name by examining process path and parent chain
-    # Uses Get-Process Path and Parent properties (cross-platform, no Win32_Process)
+    $owned      = $false
+    $proxyPid   = $null
+    $agentId    = $null
     $clientName = $null
-    try {
-        $proxyProcess = Get-Process -Id $proxyPid -ErrorAction SilentlyContinue
-        $currentProcess = $proxyProcess
 
-        for ($i = 0; $currentProcess -and $i -lt 5; $i++) {
-            $processName = $currentProcess.ProcessName.ToLower()
-            $processPath = $currentProcess.Path
+    # Owned: PSMCP.{proxyPid}.{agentId}.{pwshPid} (4 segments)
+    # Unowned: PSMCP.{pwshPid} (2 segments)
+    $segments = if ($pipeName) { $pipeName.Split('.') } else { @() }
+    if ($segments.Length -eq 4) {
+        $owned    = $true
+        $proxyPid = [int]$segments[1]
+        $agentId  = $segments[2]
 
-            # Check process name and path for known clients
-            if ($processName -eq 'claude' -or $processPath -match 'AnthropicClaude') {
-                $clientName = 'Claude Desktop'
-                break
+        # Determine client name by examining process path and parent chain
+        # Uses Get-Process Path and Parent properties (cross-platform, no Win32_Process)
+        try {
+            $proxyProcess = Get-Process -Id $proxyPid -ErrorAction SilentlyContinue
+            $currentProcess = $proxyProcess
+            for ($i = 0; $currentProcess -and $i -lt 5; $i++) {
+                $processName = $currentProcess.ProcessName.ToLower()
+                $processPath = $currentProcess.Path
+                if ($processName -eq 'claude' -or $processPath -match 'AnthropicClaude') { $clientName = 'Claude Desktop'; break }
+                elseif ($processName -eq 'node' -or $processPath -match 'claude-code|claude_code') { $clientName = 'Claude Code'; break }
+                elseif ($processName -match '^code$|^code - insiders$') { $clientName = 'VS Code'; break }
+                elseif ($processName -match 'cursor') { $clientName = 'Cursor'; break }
+                $currentProcess = $currentProcess.Parent
             }
-            elseif ($processName -eq 'node' -or $processPath -match 'claude-code|claude_code') {
-                $clientName = 'Claude Code'
-                break
-            }
-            elseif ($processName -match '^code$|^code - insiders$') {
-                $clientName = 'VS Code'
-                break
-            }
-            elseif ($processName -match 'cursor') {
-                $clientName = 'Cursor'
-                break
-            }
-
-            # Get parent process (PowerShell 7.4+, cross-platform)
-            $currentProcess = $currentProcess.Parent
+            if (-not $clientName -and $proxyProcess) { $clientName = $proxyProcess.ProcessName }
         }
-
-        # Fallback to proxy process name
-        if (-not $clientName -and $proxyProcess) {
-            $clientName = $proxyProcess.ProcessName
+        catch {
+            # Ignore errors in process lookup
         }
     }
-    catch {
-        # Ignore errors in process lookup
-    }
 
-    return [PSCustomObject]@{
-        Owned      = $true
-        ProxyPid   = $proxyPid
-        AgentId    = $agentId
-        ClientName = $clientName
+    [PowerShell.MCP.Status]@{
+        EngineReady = $engineReady
+        Owned       = $owned
+        ProxyPid    = $proxyPid
+        AgentId     = $agentId
+        ClientName  = $clientName
+        LastError   = $lastError
     }
+}
+
+function Get-MCPOwner {
+    [CmdletBinding()]
+    [OutputType('PowerShell.MCP.Status')]
+    param()
+
+    Get-McpStatus
 }
 
 
@@ -444,6 +420,37 @@ function Stop-AllPwsh {
 
     # Stop self last
     Stop-Process -Id $PID -Force
+}
+
+function Restart-MCPServer {
+    <#
+    .SYNOPSIS
+        Retries starting the PowerShell.MCP console engine.
+    .DESCRIPTION
+        If the embedded polling engine was blocked at import (usually a
+        transient antivirus/AMSI false positive), the module stays loaded but
+        commands are unavailable until the engine starts. Run this in the
+        affected console to retry. Safe to run when the engine is already
+        running (the engine setup is idempotent).
+    .EXAMPLE
+        Restart-MCPServer
+    #>
+    [CmdletBinding()]
+    [OutputType('PowerShell.MCP.Status')]
+    param()
+
+    [void][PowerShell.MCP.MCPModuleInitializer]::TryStartEngine()
+
+    $status = Get-McpStatus
+
+    # Actionable hint on the warning stream only (does not clutter the object
+    # output, so the function stays a clean object-returner like Get-MCPOwner).
+    if (-not $status.EngineReady) {
+        Write-Warning "[PowerShell.MCP] Console engine still not running. Last error: $($status.LastError)"
+        Write-Warning "If this persists, it may be Constrained Language Mode / WDAC or an AV policy rather than a transient AMSI block. See https://github.com/yotsuda/PowerShell.MCP"
+    }
+
+    $status
 }
 
 

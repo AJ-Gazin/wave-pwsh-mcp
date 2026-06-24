@@ -8,46 +8,6 @@ namespace PowerShell.MCP.Proxy.Services;
 
 public class PowerShellProcessManager
 {
-    private const string PowerShellExecutableName = "pwsh";
-
-    /// <summary>
-    /// Checks if a PowerShell process is running
-    /// </summary>
-    /// <returns>true if PowerShell process is found</returns>
-    public static bool IsPowerShellProcessRunning()
-    {
-        try
-        {
-            var processes = Process.GetProcessesByName(PowerShellExecutableName);
-            var found = processes.Length > 0;
-
-            // Release process object resources
-            foreach (var process in processes)
-            {
-                process.Dispose();
-            }
-
-            return found;
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Error checking PowerShell process: {ex.Message}");
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// Starts PowerShell process with PowerShell.MCP module imported
-    /// </summary>
-    /// <param name="agentId">Agent ID for console isolation</param>
-    /// <param name="startupCommands">Optional PowerShell commands to execute after module import (e.g. Write-Host statements)</param>
-    /// <returns>true if startup succeeded</returns>
-    public static async Task<bool> StartPowerShellWithModuleAsync(string agentId, string? startupCommands = null)
-    {
-        var (success, _) = await StartPowerShellWithModuleAndPipeNameAsync(agentId, startupCommands);
-        return success;
-    }
-
     /// <summary>
     /// Starts PowerShell process with PowerShell.MCP module imported and returns pipe name
     /// </summary>
@@ -186,7 +146,7 @@ public class PowerShellProcessManager
                 using var doc = System.Text.Json.JsonDocument.Parse(response);
                 var status = doc.RootElement.GetProperty("status").GetString();
 
-                if (status == PipeStatus.Standby || status == PipeStatus.Completed)
+                if (PipeStatus.IsReady(status))
                 {
                     return pipe;
                 }
@@ -205,6 +165,24 @@ public class PowerShellProcessManager
 /// </summary>
 internal static class PwshLauncherShared
 {
+    internal const string NoProfileArgument = "-NoProfile";
+
+    // Force the new console's active code page to UTF-8 BEFORE PSReadLine
+    // imports. On Japanese / Chinese / Korean Windows the system code page
+    // is 932 / 936 / 949, and CREATE_NEW_CONSOLE inherits that as the
+    // console's active code page. PowerShell 7 sets [Console]::OutputEncoding
+    // to UTF-8 but leaves InputEncoding alone, so PSReadLine's menu rendering
+    // (which goes through Win32 console APIs that respect the active code
+    // page in some paths) ends up reinterpreting UTF-8 writes as the legacy
+    // multibyte encoding and produces mojibake on tab completion menus.
+    // Setting chcp + both Console encodings BEFORE Import-Module PSReadLine
+    // makes the launched console UTF-8 throughout. Safe on non-CJK systems
+    // (UTF-8 covers ASCII / Latin-1 just as well).
+    internal const string EncodingPrelude =
+        "chcp 65001 | Out-Null; "
+        + "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; "
+        + "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ";
+
     // Install-PSResource on case-sensitive file systems (Linux, case-sensitive APFS on macOS)
     // may create the module directory as 'powershell.mcp'. Rename it so Import-Module can
     // locate the PascalCase name. No-op on case-insensitive file systems.
@@ -224,7 +202,7 @@ internal static class PwshLauncherShared
             : $"Set-Location -LiteralPath '{startLocation.Replace("'", "''")}'; ";
 
         var escapedAgentId = agentId.Replace("'", "''");
-        var core = $"{setLocation}$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {ModuleCaseFix}Import-Module PowerShell.MCP -Force; Remove-Module PSReadLine -ErrorAction SilentlyContinue";
+        var core = $"{EncodingPrelude}{setLocation}$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {ModuleCaseFix}Import-Module PowerShell.MCP -Force; Remove-Module PSReadLine -ErrorAction SilentlyContinue";
         return string.IsNullOrEmpty(startupCommands) ? core : $"{core}; {startupCommands}";
     }
 
@@ -254,13 +232,50 @@ internal static class PwshLauncherShared
     // KEEPS PSReadLine (Wave blocks and Windows consoles are real PTYs — unlike the
     // non-Windows path which strips PSReadLine). cwd is established externally
     // (CreateProcessW lpCurrentDirectory / Wave cmd:cwd), so no Set-Location here.
+    // The EncodingPrelude flips the console code page + Console.* encodings to UTF-8
+    // before PSReadLine imports, so menu rendering doesn't mojibake on CJK Windows
+    // (upstream fix; applies to both the native console and Wave blocks).
+    // Honors POWERSHELL_MCP_MODULE_PATH (via modulePath) so a dev build imports its own module.
     internal static string BuildWindowsInitBody(int proxyPid, string agentId, string? startupCommands, string? modulePath)
     {
         var escapedAgentId = agentId.Replace("'", "''");
         var moduleImport = BuildModuleImport(modulePath);
-        var core = $"$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {moduleImport}; Import-Module PSReadLine";
+        var core = $"{EncodingPrelude}$global:PowerShellMCPProxyPid = {proxyPid}; $global:PowerShellMCPAgentId = '{escapedAgentId}'; {moduleImport}; Import-Module PSReadLine";
         return string.IsNullOrEmpty(startupCommands) ? core : $"{core}; {startupCommands}";
     }
+
+    // Windows counterpart to BuildInitCommand (by-name module resolution, no explicit
+    // module path). Thin overload over BuildWindowsInitBody with the production default:
+    // KEEPS PSReadLine, omits Set-Location/ModuleCaseFix, and carries the UTF-8 prelude.
+    internal static string BuildWindowsInitCommand(int proxyPid, string agentId, string? startupCommands) =>
+        BuildWindowsInitBody(proxyPid, agentId, startupCommands, null);
+
+    // Set once at startup from the proxy's `--no-profile` command-line flag.
+    // Gates -NoProfile on the *interactive* launchers (Windows/macOS/Linux) only.
+    // Default false: those consoles are real human-facing shells, so they load the
+    // user's $PROFILE (prompt, aliases, PSReadLine, theme) unless the operator opts
+    // out. The headless launcher always uses -NoProfile regardless — see
+    // BuildHeadlessPwshArguments.
+    internal static bool SuppressProfileOnInteractive { get; set; }
+
+    private static string InteractiveProfileArg(bool noProfile) =>
+        noProfile ? $"{NoProfileArgument} " : string.Empty;
+
+    internal static string BuildWindowsCommandLine(string command, bool noProfile) =>
+        $"pwsh.exe {InteractiveProfileArg(noProfile)}-NoExit -Command \"{command}\"";
+
+    internal static string BuildMacOSDoScriptCommand(string tempFile, bool noProfile) =>
+        $"pwsh {InteractiveProfileArg(noProfile)}-NoExit -File '{tempFile}'";
+
+    internal static string BuildLinuxPwshCommand(string encodedCommand, bool noProfile) =>
+        $"exec pwsh {InteractiveProfileArg(noProfile)}-NoExit -EncodedCommand {encodedCommand}";
+
+    // The headless / CI launcher (no window, redirected stdout) always suppresses
+    // the profile: there's no interactive UX to preserve, and a profile there only
+    // adds nondeterminism, startup latency, host-write noise, and the risk of
+    // blocking on input (e.g. Read-Host) in a process with no console.
+    internal static string[] BuildHeadlessPwshArguments(string initCommand) =>
+        [NoProfileArgument, "-NoExit", "-Command", initCommand];
 }
 
 /// <summary>
@@ -348,11 +363,13 @@ public static class PwshLauncherWindows
 
             // Build command with optional startup commands (pre-built Write-Host statements).
             // Set global variables with proxy PID and agent ID before importing module.
-            // Honors POWERSHELL_MCP_MODULE_PATH so a dev build imports its own module.
+            // Honors POWERSHELL_MCP_MODULE_PATH so a dev build imports its own module, and
+            // carries the UTF-8 EncodingPrelude (see BuildWindowsInitBody) so menu rendering
+            // on CJK Windows doesn't mojibake. -NoProfile is gated on the --no-profile flag.
             var proxyPid = Process.GetCurrentProcess().Id;
             var modulePath = PwshLauncherShared.ResolveModulePath();
             var command = PwshLauncherShared.BuildWindowsInitBody(proxyPid, agentId, startupCommands, modulePath);
-            string commandLine = $"pwsh.exe -NoExit -Command \"{command}\"";
+            string commandLine = PwshLauncherShared.BuildWindowsCommandLine(command, PwshLauncherShared.SuppressProfileOnInteractive);
 
             bool ok = CreateProcessW(
                 null,
@@ -735,7 +752,7 @@ public static class PwshLauncherMacOS
         {
             process.StandardInput.WriteLine("tell application \"Terminal\"");
             process.StandardInput.WriteLine("    activate");
-            process.StandardInput.WriteLine($"    do script \"pwsh -NoExit -File '{tempFile}'\"");
+            process.StandardInput.WriteLine($"    do script \"{PwshLauncherShared.BuildMacOSDoScriptCommand(tempFile, PwshLauncherShared.SuppressProfileOnInteractive)}\"");
             process.StandardInput.WriteLine("end tell");
             process.StandardInput.Close();
             process.WaitForExit(5000);
@@ -826,7 +843,7 @@ public static class PwshLauncherLinux
 
             // Command to launch pwsh with encoded initialization via login shell
             // exec replaces the shell with pwsh to keep the process tree clean
-            var pwshCommand = $"exec pwsh -NoExit -EncodedCommand {encodedCommand}";
+            var pwshCommand = PwshLauncherShared.BuildLinuxPwshCommand(encodedCommand, PwshLauncherShared.SuppressProfileOnInteractive);
 
             // setsid <terminal> ... <shell> -l -c '<pwshCommand>'
             psi.ArgumentList.Add(terminal);
@@ -919,9 +936,10 @@ public static class PwshLauncherLinux
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
-        psi.ArgumentList.Add("-NoExit");
-        psi.ArgumentList.Add("-Command");
-        psi.ArgumentList.Add(initCommand);
+        foreach (var argument in PwshLauncherShared.BuildHeadlessPwshArguments(initCommand))
+        {
+            psi.ArgumentList.Add(argument);
+        }
 
         var process = Process.Start(psi);
         if (process != null)

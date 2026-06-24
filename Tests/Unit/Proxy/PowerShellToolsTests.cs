@@ -30,6 +30,13 @@ public class PowerShellToolsTests
         _mockPowerShellService = new Mock<IPowerShellService>();
         _mockPipeDiscoveryService = new Mock<IPipeDiscoveryService>();
         TestAgentId = ConsoleSessionManager.Instance.AllocateSubAgentId();
+        // These tests exercise an ESTABLISHED session (owned-active console), so
+        // mark the agent as already-attached. Without this, each test's first
+        // invoke_expression would be the proxy-lifetime FIRST attach and trigger
+        // the new-session treatment ($HOME normalization + notice), which is
+        // covered separately by the dedicated first-attach tests with their own
+        // unmarked agent ids.
+        ConsoleSessionManager.Instance.TryMarkFirstAttach(TestAgentId);
         // Pipe name format: PSMCP.{proxyPid}.{agentId}.{pwshPid}. Match the agent id
         // so any code that re-derives agentId from the pipe name (or filters by it)
         // sees consistent values.
@@ -624,7 +631,10 @@ public class PowerShellToolsTests
     [Fact]
     public async Task InvokeExpression_DefaultAgentId_UsesDefault()
     {
-        // Arrange: no agent_id provided (should default to "default")
+        // Arrange: no agent_id provided (should default to "default"). Mark the
+        // shared "default" agent as already-attached so this test exercises the
+        // owned-active path (it asserts agent-id defaulting, not first-attach).
+        ConsoleSessionManager.Instance.TryMarkFirstAttach("default");
         _mockPipeDiscoveryService
             .Setup(s => s.FindReadyPipeAsync("default", It.IsAny<CancellationToken>(), It.IsAny<bool>()))
             .ReturnsAsync(new PipeDiscoveryResult(TestPipeName, false, new List<string>(), null));
@@ -1030,7 +1040,7 @@ public class PowerShellToolsTests
         // Assert: pipeline NOT executed, notice describes the change
         Assert.False(executed, "Pipeline must not execute when user-cd drift is detected");
         Assert.Contains("Pipeline NOT executed", result);
-        Assert.Contains("User changed cwd", result);
+        Assert.Contains("outside the AI's commands", result);
         Assert.Contains(aiCwd, result);
         Assert.Contains(liveCwd, result);
         Assert.Contains("Re-issue", result);
@@ -1082,6 +1092,99 @@ public class PowerShellToolsTests
         Assert.DoesNotContain("User changed cwd", result);
 
         // Cleanup
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, null);
+    }
+
+    [Fact]
+    public async Task InvokeExpression_TrailingSlashCwdDifference_IsNotDrift()
+    {
+        // DetectCwdDrift normalizes via Path.GetFullPath, so "…\proj" and
+        // "…\proj\" are the same directory and must NOT trigger a spurious
+        // drift bail. Holds on every OS (the trailing separator is stripped
+        // before the comparison).
+        var sessionManager = ConsoleSessionManager.Instance;
+        const int testPid = 88830;
+        var pipeName = $"PSMCP.{sessionManager.ProxyPid}.{TestAgentId}.{testPid}";
+        var baseCwd = Path.Combine(Path.GetTempPath(), "trailing-slash-cwd");
+        var aiCwd = baseCwd;
+        var liveCwd = baseCwd + Path.DirectorySeparatorChar; // same dir, trailing sep
+
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, aiCwd);
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, false, new List<string>(), null, liveCwd));
+
+        string? sentPipeline = null;
+        var headerJson = JsonSerializer.Serialize(new { pid = testPid, status = "success", pipeline = "Get-Date", duration = 0.01, cwd = liveCwd });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback<string, string, Dictionary<string, string>?, int, CancellationToken>((_, p, _, _, _) => sentPipeline = p)
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object,
+            _mockPipeDiscoveryService.Object,
+            "Get-Date",
+            agent_id: TestAgentId);
+
+        Assert.Equal("Get-Date", sentPipeline);                 // executed verbatim
+        Assert.DoesNotContain("Pipeline NOT executed", result); // no drift bail
+
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, null);
+    }
+
+    [Fact]
+    public async Task InvokeExpression_CaseOnlyCwdDifference_DriftIsOSDependent()
+    {
+        // DetectCwdDrift compares case-insensitively on Windows (NTFS) and
+        // case-sensitively elsewhere. A cwd differing ONLY in letter case must
+        // therefore be "no drift" on Windows but genuine drift on Linux/macOS —
+        // this test pins that documented per-OS behavior on whichever OS runs it.
+        var sessionManager = ConsoleSessionManager.Instance;
+        const int testPid = 88831;
+        var pipeName = $"PSMCP.{sessionManager.ProxyPid}.{TestAgentId}.{testPid}";
+        var aiCwd = Path.Combine(Path.GetTempPath(), "CwdCaseProj");
+        var liveCwd = Path.Combine(Path.GetTempPath(), "cwdcaseproj"); // same but lowercased leaf
+
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, aiCwd);
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, false, new List<string>(), null, liveCwd));
+
+        string? sentPipeline = null;
+        var headerJson = JsonSerializer.Serialize(new { pid = testPid, status = "success", pipeline = "Get-Date", duration = 0.01, cwd = liveCwd });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback<string, string, Dictionary<string, string>?, int, CancellationToken>((_, p, _, _, _) => sentPipeline = p)
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object,
+            _mockPipeDiscoveryService.Object,
+            "Get-Date",
+            agent_id: TestAgentId);
+
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Equal("Get-Date", sentPipeline);                 // case-insensitive → no drift
+            Assert.DoesNotContain("Pipeline NOT executed", result);
+        }
+        else
+        {
+            Assert.Null(sentPipeline);                              // case-sensitive → drift bail
+            Assert.Contains("Pipeline NOT executed", result);
+        }
+
         sessionManager.SetLastAiCwd(TestAgentId, testPid, null);
     }
 
@@ -1213,16 +1316,120 @@ public class PowerShellToolsTests
         sessionManager.SetLastAiCwd(TestAgentId, testPid, null);
     }
 
+    [Fact]
+    public async Task InvokeExpression_UserCdDrift_WarnsExactlyOnce_ThenReissueExecutes()
+    {
+        // End-to-end "warned exactly once" property, driven through the SAME
+        // ConsoleSessionManager state across two real calls (not hand-reset
+        // between them): the user typed `cd` in the console, so call 1 bails
+        // with a drift warning WITHOUT executing. That bail updates LastAiCwd
+        // to the live cwd, clearing the drift — so call 2 (same pipeline, the
+        // console still sitting at the user's cwd) executes with no warning.
+        var sessionManager = ConsoleSessionManager.Instance;
+        const int testPid = 88840;
+        var pipeName = $"PSMCP.{sessionManager.ProxyPid}.{TestAgentId}.{testPid}";
+        var aiCwd = Path.Combine(Path.GetTempPath(), "ai-was-here");
+        var userCwd = Path.Combine(Path.GetTempPath(), "user-cd-here");
+
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, aiCwd);
+
+        // User moved once; live cwd is userCwd and stays there for both calls.
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, false, new List<string>(), null, userCwd));
+
+        var executions = 0;
+        var headerJson = JsonSerializer.Serialize(new { pid = testPid, status = "success", pipeline = "Get-ChildItem", duration = 0.01, cwd = userCwd });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback(() => executions++)
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        // Call 1: user-cd drift → warn, must NOT execute.
+        var first = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, "Get-ChildItem", agent_id: TestAgentId);
+        Assert.Contains("Pipeline NOT executed", first);
+        Assert.Contains("outside the AI's commands", first);
+        Assert.Equal(0, executions);
+
+        // Call 2: re-issue. Drift cleared by call 1 → execute, no second warning.
+        var second = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, "Get-ChildItem", agent_id: TestAgentId);
+        Assert.DoesNotContain("Pipeline NOT executed", second);
+        Assert.Equal(1, executions);
+
+        // Cleanup
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, null);
+    }
+
+    [Fact]
+    public async Task InvokeExpression_AiChangesOwnCwd_NeverWarns_AndTracksTheMove()
+    {
+        // The other half of the asymmetry: when the AI moves its OWN cwd
+        // (Set-Location in its pipeline) there is no warning on that call, and
+        // the move is recorded as LastAiCwd — so the next call (console now at
+        // the AI's new cwd) also runs with no warning. Only a cwd change the AI
+        // did NOT make (the user) ever warns.
+        var sessionManager = ConsoleSessionManager.Instance;
+        const int testPid = 88841;
+        var pipeName = $"PSMCP.{sessionManager.ProxyPid}.{TestAgentId}.{testPid}";
+        var oldCwd = Path.Combine(Path.GetTempPath(), "ai-start");
+        var newCwd = Path.Combine(Path.GetTempPath(), "ai-moved-here");
+
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, oldCwd);
+
+        // Live cwd: oldCwd before the AI's Set-Location, newCwd after it.
+        _mockPipeDiscoveryService
+            .SetupSequence(s => s.FindReadyPipeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, false, new List<string>(), null, oldCwd))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, false, new List<string>(), null, newCwd));
+
+        var sentPipelines = new List<string>();
+        // Both executed pipelines report ending at newCwd (call 1 moved there,
+        // call 2 stayed) — this is what the success path snapshots as LastAiCwd.
+        var headerJson = JsonSerializer.Serialize(new { pid = testPid, status = "success", pipeline = "x", duration = 0.01, cwd = newCwd });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback<string, string, Dictionary<string, string>?, int, CancellationToken>((_, p, _, _, _) => sentPipelines.Add(p))
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        // Call 1: AI moves its own cwd. No drift (live==LastAi==oldCwd) → runs,
+        // no warning; the move is recorded.
+        var first = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object,
+            $"Set-Location -LiteralPath '{newCwd.Replace("'", "''")}'", agent_id: TestAgentId);
+        Assert.DoesNotContain("Pipeline NOT executed", first);
+        Assert.Equal(newCwd, sessionManager.GetLastAiCwd(testPid));
+
+        // Call 2: console now at newCwd, LastAiCwd matches → still no warning.
+        var second = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, "Get-ChildItem", agent_id: TestAgentId);
+        Assert.DoesNotContain("Pipeline NOT executed", second);
+        Assert.Equal(2, sentPipelines.Count); // both calls executed
+
+        // Cleanup
+        sessionManager.SetLastAiCwd(TestAgentId, testPid, null);
+    }
+
     #endregion
 
     #region StartConsole unowned-claim gating
 
     [Fact]
-    public async Task StartConsole_NoStartLocation_SkipsUnownedClaim()
+    public async Task StartConsole_NoReason_IncludesUnownedForReuse()
     {
-        // Arrange: no start_location → caller hasn't pinned a target cwd, so
-        // claiming an arbitrary user-set unowned console would mislead the AI.
-        // FindReadyPipeAsync must be invoked with includeUnowned=false.
+        // Reuse-first to avoid filling the desktop with console windows: with no
+        // reason, start_console reclaims ANY available console — including an
+        // unowned one — rather than always spawning. So discovery must run with
+        // includeUnowned=true even without a start_location (the old gate, which
+        // skipped unowned unless start_location was pinned, has been removed; the
+        // first-attach treatment now handles the reclaimed-cwd concern instead).
         _mockPipeDiscoveryService
             .Setup(s => s.FindReadyPipeAsync(It.IsAny<string>(), It.IsAny<CancellationToken>(), It.IsAny<bool>()))
             .ReturnsAsync(new PipeDiscoveryResult(TestPipeName, false, new List<string>(), null));
@@ -1235,15 +1442,15 @@ public class PowerShellToolsTests
             .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), TestPipeName, It.IsAny<CancellationToken>()))
             .ReturnsAsync(new CachedOutputResult("", ""));
 
-        // Act: no start_location
+        // Act: no reason, no start_location
         await PowerShellTools.StartConsole(
             _mockPowerShellService.Object,
             _mockPipeDiscoveryService.Object,
             agent_id: TestAgentId);
 
-        // Assert: includeUnowned=false in the discovery call
+        // Assert: includeUnowned=true in the discovery call
         _mockPipeDiscoveryService.Verify(
-            s => s.FindReadyPipeAsync(TestAgentId, It.IsAny<CancellationToken>(), false),
+            s => s.FindReadyPipeAsync(TestAgentId, It.IsAny<CancellationToken>(), true),
             Times.Once);
     }
 
@@ -1276,6 +1483,193 @@ public class PowerShellToolsTests
         _mockPipeDiscoveryService.Verify(
             s => s.FindReadyPipeAsync(TestAgentId, It.IsAny<CancellationToken>(), true),
             Times.Once);
+    }
+
+    #endregion
+
+    #region First-attach (resume / cold-start) new-session treatment
+
+    [Fact]
+    public async Task InvokeExpression_FirstAttach_MovesToHomeAndAnnouncesNewSession()
+    {
+        // A fresh (never-attached) agent reclaiming an existing console at a prior
+        // session's cwd is the resume / cold-start boundary. invoke_expression runs
+        // (no suppression) but normalizes to $HOME by prefixing the pipeline, and
+        // announces the new server session with a restore hint for the old cwd.
+        var freshAgent = ConsoleSessionManager.Instance.AllocateSubAgentId(); // unmarked
+        var pipeName = $"PSMCP.{ConsoleSessionManager.Instance.ProxyPid}.{freshAgent}.94001";
+        var reclaimedCwd = Path.Combine(Path.GetTempPath(), "prior-session-cwd");
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(freshAgent, It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, true, new List<string>(), null, reclaimedCwd));
+        _mockPowerShellService
+            .Setup(s => s.SetWindowTitleAsync(pipeName, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        string? sentPipeline = null;
+        var headerJson = JsonSerializer.Serialize(new { pid = 94001, status = "success", pipeline = "x", duration = 0.01, cwd = "C:\\Users\\test" });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback<string, string, Dictionary<string, string>?, int, CancellationToken>((_, p, _, _, _) => sentPipeline = p)
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, "Get-ChildItem", agent_id: freshAgent);
+
+        // Ran (not suppressed), prefixed with a Set-Location to $HOME.
+        Assert.NotNull(sentPipeline);
+        Assert.StartsWith("Set-Location -LiteralPath '", sentPipeline);
+        Assert.EndsWith("; Get-ChildItem", sentPipeline);
+        Assert.DoesNotContain("Pipeline NOT executed", result);
+        // New-session notice with the prior-cwd restore hint.
+        Assert.Contains("New server session", result);
+        Assert.Contains(reclaimedCwd, result);
+
+        ConsoleSessionManager.Instance.SetLastAiCwd(freshAgent, 94001, null);
+    }
+
+    [Fact]
+    public async Task InvokeExpression_SecondCall_NoNewSessionNoticeOrHomeMove()
+    {
+        // The new-session treatment is once per proxy lifetime. After the first
+        // attach marks the agent, a subsequent call runs verbatim with no
+        // $HOME prefix and no new-session notice.
+        var freshAgent = ConsoleSessionManager.Instance.AllocateSubAgentId();
+        var pipeName = $"PSMCP.{ConsoleSessionManager.Instance.ProxyPid}.{freshAgent}.94002";
+        ConsoleSessionManager.Instance.TryMarkFirstAttach(freshAgent); // already attached
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(freshAgent, It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, false, new List<string>(), null, null));
+
+        string? sentPipeline = null;
+        var headerJson = JsonSerializer.Serialize(new { pid = 94002, status = "success", pipeline = "Get-Date", duration = 0.01, cwd = "C:\\Users\\test" });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback<string, string, Dictionary<string, string>?, int, CancellationToken>((_, p, _, _, _) => sentPipeline = p)
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, "Get-Date", agent_id: freshAgent);
+
+        Assert.Equal("Get-Date", sentPipeline); // verbatim, no $HOME prefix
+        Assert.DoesNotContain("New server session", result);
+
+        ConsoleSessionManager.Instance.SetLastAiCwd(freshAgent, 94002, null);
+    }
+
+    [Fact]
+    public async Task InvokeExpression_FirstAttachAlreadyAtHome_AnnouncesNewSessionWithoutRestoreHint()
+    {
+        // The spawn case (and any reclaim that happens to land at $HOME): on the
+        // first attach the console is already at $HOME, so the pipeline is still
+        // normalized to $HOME and the new-session notice fires, but there is NO
+        // prior cwd to restore (priorCwd is null when liveCwd == home). Complements
+        // the reclaim-at-a-different-cwd test, which DOES carry a restore hint.
+        var freshAgent = ConsoleSessionManager.Instance.AllocateSubAgentId(); // unmarked
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var pipeName = $"PSMCP.{ConsoleSessionManager.Instance.ProxyPid}.{freshAgent}.94005";
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(freshAgent, It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, true, new List<string>(), null, home));
+        _mockPowerShellService
+            .Setup(s => s.SetWindowTitleAsync(pipeName, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        string? sentPipeline = null;
+        var headerJson = JsonSerializer.Serialize(new { pid = 94005, status = "success", pipeline = "x", duration = 0.01, cwd = home });
+        _mockPowerShellService
+            .Setup(s => s.InvokeExpressionToPipeAsync(pipeName, It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), 170, It.IsAny<CancellationToken>()))
+            .Callback<string, string, Dictionary<string, string>?, int, CancellationToken>((_, p, _, _, _) => sentPipeline = p)
+            .ReturnsAsync(headerJson + "\n\n✓ done");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.InvokeExpression(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, "Get-ChildItem", agent_id: freshAgent);
+
+        Assert.NotNull(sentPipeline);
+        Assert.StartsWith("Set-Location -LiteralPath '", sentPipeline);     // still normalized to $HOME
+        Assert.EndsWith("; Get-ChildItem", sentPipeline);
+        Assert.DoesNotContain("Pipeline NOT executed", result);
+        Assert.Contains("New server session", result);
+        Assert.DoesNotContain("to resume there", result);                   // no restore hint: already at $HOME
+
+        ConsoleSessionManager.Instance.SetLastAiCwd(freshAgent, 94005, null);
+    }
+
+    [Fact]
+    public async Task GetCurrentLocation_FirstAttach_PreservesCwdAndAnnouncesNewSession()
+    {
+        // get_current_location is a query — on first attach it PRESERVES the
+        // reclaimed console's cwd (no $HOME move, no restore hint) and only
+        // surfaces the new-session notice so the AI knows prior state may differ.
+        var freshAgent = ConsoleSessionManager.Instance.AllocateSubAgentId();
+        var pipeName = $"PSMCP.{ConsoleSessionManager.Instance.ProxyPid}.{freshAgent}.94003";
+        var reclaimedCwd = Path.Combine(Path.GetTempPath(), "user-prepared-cwd");
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(freshAgent, It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, true, new List<string>(), null, reclaimedCwd));
+        _mockPowerShellService
+            .Setup(s => s.SetWindowTitleAsync(pipeName, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockPowerShellService
+            .Setup(s => s.GetCurrentLocationFromPipeAsync(pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync($"Location [FileSystem]: {reclaimedCwd}");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.GetCurrentLocation(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, agent_id: freshAgent);
+
+        Assert.Contains("New server session", result);
+        Assert.Contains(reclaimedCwd, result);       // preserved cwd reported
+        Assert.DoesNotContain("to resume there", result); // no restore hint (we didn't move)
+        // get_current_location never runs a pipeline, so it never injects a Set-Location.
+        _mockPowerShellService.Verify(
+            s => s.InvokeExpressionToPipeAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<Dictionary<string, string>?>(), It.IsAny<int>(), It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task StartConsole_FirstAttachReclaim_AnnouncesNewSession()
+    {
+        // start_console reclaiming an unowned console (ConsoleSwitched) on first
+        // attach surfaces the new-session notice (and preserves cwd — it is a
+        // setup/query tool, not an executor).
+        var freshAgent = ConsoleSessionManager.Instance.AllocateSubAgentId();
+        var pipeName = $"PSMCP.{ConsoleSessionManager.Instance.ProxyPid}.{freshAgent}.94004";
+        var reclaimedCwd = Path.Combine(Path.GetTempPath(), "startconsole-reclaim");
+
+        _mockPipeDiscoveryService
+            .Setup(s => s.FindReadyPipeAsync(freshAgent, It.IsAny<CancellationToken>(), It.IsAny<bool>()))
+            .ReturnsAsync(new PipeDiscoveryResult(pipeName, true, new List<string>(), null, reclaimedCwd));
+        _mockPowerShellService
+            .Setup(s => s.SetWindowTitleAsync(pipeName, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockPowerShellService
+            .Setup(s => s.GetCurrentLocationFromPipeAsync(pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync($"Location [FileSystem]: {reclaimedCwd}");
+        _mockPipeDiscoveryService
+            .Setup(s => s.CollectAllCachedOutputsAsync(It.IsAny<string>(), pipeName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(new CachedOutputResult("", ""));
+
+        var result = await PowerShellTools.StartConsole(
+            _mockPowerShellService.Object, _mockPipeDiscoveryService.Object, agent_id: freshAgent);
+
+        Assert.Contains("New server session", result);
+        Assert.Contains(reclaimedCwd, result);
     }
 
     #endregion

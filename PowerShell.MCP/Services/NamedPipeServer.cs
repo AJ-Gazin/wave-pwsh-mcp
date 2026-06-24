@@ -273,6 +273,26 @@ public static class ExecutionState
             return result;
         }
     }
+
+    /// <summary>
+    /// Discards any undrained cached outputs and the "cache on completion"
+    /// flag. Called when the owning AI session goes away (see
+    /// MCPModuleInitializer.ReleaseConsole): that output belonged to the
+    /// now-dead session, so the orphaned console must report 'standby'
+    /// rather than 'completed' with output a freshly-connecting AI would
+    /// otherwise drain as if it were its own. Unlike ConsumeCachedOutputs,
+    /// this discards without returning — there is no live consumer.
+    /// _isBusy is intentionally left untouched: a pipeline still running at
+    /// disconnect is genuinely busy and must keep reporting so.
+    /// </summary>
+    public static void ClearCachedOutputs()
+    {
+        lock (_lock)
+        {
+            _cachedOutputs.Clear();
+            _shouldCacheOutput = false;
+        }
+    }
 }
 
 /// <summary>
@@ -649,6 +669,26 @@ Please provide how to update the MCP client configuration to the user.";
             {
                 var pipeline = requestRoot.TryGetProperty("pipeline", out var pipelineElement)
                     ? pipelineElement.GetString() ?? "" : "";
+
+                // Engine not running (startup blocked, e.g. AMSI/AV false
+                // positive). Fast-fail with guidance instead of stashing the
+                // command and blocking until the full timeout — without the
+                // polling engine nothing would ever consume it. Mirrors the
+                // normal success envelope so the proxy renders the body as-is,
+                // no new error contract required.
+                if (!MCPModuleInitializer.EngineReady)
+                {
+                    var pidNotReady = Process.GetCurrentProcess().Id;
+                    var notReadyHeader = JsonSerializer.Serialize(new
+                    {
+                        pid = pidNotReady,
+                        status = "success",
+                        pipeline = TruncatePipeline(pipeline),
+                        duration = 0.0
+                    });
+                    await SendMessageAsync(pipeServer, notReadyHeader + "\n\n" + MCPModuleInitializer.GetEngineNotReadyMessage(), cancellationToken);
+                    return;
+                }
 
                 var cmdletWarning = BuildGetSetContentWarning(pipeline);
 
